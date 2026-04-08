@@ -206,7 +206,7 @@ export default {
 				const subConverterResponse = await fetch(subConverterUrl, { headers: { 'User-Agent': userAgentHeader } });//订阅转换
 				if (!subConverterResponse.ok) return new Response(base64Data, { headers: responseHeaders });
 				let subConverterContent = await subConverterResponse.text();
-				if (订阅格式 == 'clash') subConverterContent = await clashFix(subConverterContent);
+				if (订阅格式 == 'clash') subConverterContent = await clashFix(subConverterContent, env);
 				// 只有非浏览器订阅才会返回SUBNAME
 				if (!userAgent.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(FileName)}`;
 				return new Response(subConverterContent, { headers: responseHeaders });
@@ -301,7 +301,7 @@ async function MD5MD5(text) {
 	return secondHex.toLowerCase();
 }
 
-function clashFix(content) {
+function clashFix(content, env = {}) {
 	if (content.includes('wireguard') && !content.includes('remote-dns-resolve')) {
 		let lines;
 		if (content.includes('\r\n')) {
@@ -323,7 +323,79 @@ function clashFix(content) {
 
 		content = result;
 	}
+
+	content = addClashDialerProxy(content, env);
 	return content;
+}
+
+function addClashDialerProxy(content, env = {}) {
+	const dialerProxy = (env.CLASH_DIALER_PROXY || '').trim();
+	const matchRule = (env.CLASH_DIALER_MATCH || '').trim();
+	if (!dialerProxy || !matchRule) return content;
+
+	const keywords = matchRule.split(',').map(s => s.trim()).filter(Boolean);
+	if (keywords.length === 0) return content;
+
+	const lineBreak = content.includes('\r\n') ? '\r\n' : '\n';
+	const lines = content.split(/\r?\n/);
+	const nameLineRegex = /^(\s*)-\s*name:\s*(.+?)\s*$/;
+	const topLevelKeyRegex = /^[A-Za-z0-9_-]+\s*:/;
+
+	let inProxiesSection = false;
+	let currentProxyMatched = false;
+	let currentProxyHasDialer = false;
+	let currentPropIndent = '  ';
+	const output = [];
+
+	function shouldMatchProxy(name) {
+		const cleanName = name.replace(/^['"]|['"]$/g, '');
+		return keywords.some(keyword => cleanName.includes(keyword));
+	}
+
+	function flushDialerProxyIfNeeded() {
+		if (currentProxyMatched && !currentProxyHasDialer) {
+			output.push(`${currentPropIndent}dialer-proxy: ${dialerProxy}`);
+		}
+		currentProxyMatched = false;
+		currentProxyHasDialer = false;
+	}
+
+	for (const line of lines) {
+		if (!inProxiesSection) {
+			if (/^proxies:\s*$/.test(line)) {
+				inProxiesSection = true;
+			}
+			output.push(line);
+			continue;
+		}
+
+		if (topLevelKeyRegex.test(line) && !/^\s/.test(line)) {
+			flushDialerProxyIfNeeded();
+			inProxiesSection = false;
+			output.push(line);
+			continue;
+		}
+
+		const nameMatch = line.match(nameLineRegex);
+		if (nameMatch) {
+			flushDialerProxyIfNeeded();
+			currentPropIndent = `${nameMatch[1]}  `;
+			currentProxyMatched = shouldMatchProxy(nameMatch[2]);
+			output.push(line);
+			continue;
+		}
+
+		if (currentProxyMatched && /^\s*dialer-proxy\s*:/.test(line)) {
+			output.push(`${currentPropIndent}dialer-proxy: ${dialerProxy}`);
+			currentProxyHasDialer = true;
+			continue;
+		}
+
+		output.push(line);
+	}
+
+	flushDialerProxyIfNeeded();
+	return output.join(lineBreak);
 }
 
 async function proxyURL(proxyURL, url) {
